@@ -49,10 +49,11 @@ class Zynq7000(CPU):
             "rom":  0xfc00_0000,
         }
 
-    def __init__(self, platform, variant, *args, **kwargs):
+    def __init__(self, platform, variant, *args, fsbl_mode=False, **kwargs):
         super().__init__(*args, **kwargs)
         self.platform       = platform
         self.reserve_pads   = isinstance(platform.toolchain, XilinxVivadoToolchain)
+        self.fsbl_mode      = fsbl_mode
         self.reset          = Signal()
         self.periph_buses   = []    # Peripheral buses (Connected to main SoC's bus).
         self.memory_buses   = []    # Memory buses (Connected directly to LiteDRAM).
@@ -1135,6 +1136,29 @@ class Zynq7000(CPU):
                 f"generate_target all [get_ips {self.ps7_name}]",
                 f"synth_ip [get_ips {self.ps7_name}]"
             ]
+
+            # In FSBL mode, extract ps7_init files from the generated IP so
+            # they can be compiled into the BIOS as the PS initialisation
+            # sequence.
+            if self.fsbl_mode:
+                # N.B. Braces must be doubled ({{ }}) because these strings
+                # pass through Python str.format(build_name=...) in the
+                # Vivado toolchain.  {build_name} is replaced by Python;
+                # ${{...}} becomes ${...} for TCL.
+                # Vivado places generated IP output products (including
+                # ps7_init) in <build_name>.gen/sources_1/ip/<name>/.
+                self.ps7_tcl += [
+                    f"set _ps7_gen_dir [glob -nocomplain {{build_name}}.gen/sources_1/ip/{self.ps7_name}]",
+                    "if {{$_ps7_gen_dir ne \"\"}} {{",
+                    "    foreach _f [glob -nocomplain ${{_ps7_gen_dir}}/ps7_init_gpl.c ${{_ps7_gen_dir}}/ps7_init_gpl.h] {{",
+                    "        file copy -force $_f [pwd]",
+                    "    }}",
+                    "    puts \"INFO: ps7_init files copied to [pwd]\"",
+                    "}} else {{",
+                    "    puts \"WARNING: ps7_init gen directory not found\"",
+                    "}}",
+                ]
+
             self.platform.toolchain.pre_synthesis_commands += self.ps7_tcl
         else:
             # With openXC7 ps7_name is imposed by the toolchain
@@ -1200,3 +1224,94 @@ class Zynq7000(CPU):
                     ]
 
             self.platform.toolchain.pre_synthesis_commands += mac_tcl
+
+    # FSBL Boot Image Generation -------------------------------------------------------------------
+
+    def generate_fsbl_boot_image(self, builder):
+        """Post-build step for FSBL mode.
+
+        After Vivado synthesis has generated the PS7 IP and extracted
+        ps7_init files, this method:
+          1. Copies ps7_init.c/h into the BIOS source tree.
+          2. Recompiles the BIOS so the real ps7_init() overrides the
+             weak stub.
+          3. Generates a BOOT.BIN containing the BIOS (as FSBL) and
+             the PL bitstream.
+        """
+        import shutil
+        import subprocess
+
+        if not self.fsbl_mode:
+            return
+
+        gateware_dir = builder.gateware_dir
+        software_dir = builder.software_dir
+        build_name   = builder.soc.get_build_name()
+
+        # --- 1. Copy ps7_init files from gateware build dir ---
+        bios_dir    = os.path.join(software_dir, "bios")
+        include_dir = os.path.join(software_dir, "include")
+        ps7_init_c  = os.path.join(gateware_dir, "ps7_init_gpl.c")
+        ps7_init_h  = os.path.join(gateware_dir, "ps7_init_gpl.h")
+
+        if not os.path.exists(ps7_init_c):
+            print("WARNING: ps7_init_gpl.c not found in gateware dir.")
+            print(f"  Expected: {ps7_init_c}")
+            print("  BOOT.BIN will use the weak ps7_init stub (PS not initialised).")
+            return
+
+        shutil.copy2(ps7_init_c, os.path.join(bios_dir, "ps7_init.c"))
+        if os.path.exists(ps7_init_h):
+            # Copy header to both include dir and bios dir — ps7_init.c
+            # includes it via "ps7_init_gpl.h" (local include).
+            shutil.copy2(ps7_init_h, os.path.join(include_dir, "ps7_init.h"))
+            shutil.copy2(ps7_init_h, os.path.join(bios_dir, "ps7_init_gpl.h"))
+        print(f"Copied ps7_init files to {bios_dir}")
+
+        # --- 2. Recompile BIOS with real ps7_init ---
+        # Locate the BIOS Makefile via the litex.soc.cores.cpu package path.
+        bios_makefile = os.path.join(
+            os.path.dirname(__file__),  # .../cpu/zynq7000/
+            "..", "..", "..",           # .../soc/
+            "software", "bios", "Makefile")
+        print("Recompiling BIOS with ps7_init...")
+        subprocess.check_call(["make", "-C", bios_dir, "-f",
+            bios_makefile, "bios.bin"], timeout=120)
+
+        # --- 3. Generate BOOT.BIN ---
+        bios_elf    = os.path.join(bios_dir, "bios.elf")
+        bitstream   = os.path.join(gateware_dir, f"{build_name}.bit")
+        boot_bin    = os.path.join(gateware_dir, "BOOT.BIN")
+        bif_file    = os.path.join(gateware_dir, f"{build_name}_fsbl.bif")
+
+        if not os.path.exists(bitstream):
+            print(f"WARNING: Bitstream not found at {bitstream}, skipping BOOT.BIN.")
+            return
+
+        # Write BIF file.
+        bif_contents = "\n".join([
+            "the_ROM_image:",
+            "{",
+            f"    [bootloader] {bios_elf}",
+            f"    {bitstream}",
+            "}",
+        ])
+        with open(bif_file, "w") as f:
+            f.write(bif_contents)
+
+        # Run bootgen.
+        bootgen = shutil.which("bootgen")
+        if bootgen is None:
+            print("WARNING: bootgen not found. Install Vitis or build from")
+            print("  https://github.com/Xilinx/bootgen")
+            print(f"  BIF file written to {bif_file} — run bootgen manually.")
+            return
+
+        print(f"Generating BOOT.BIN...")
+        subprocess.check_call([
+            bootgen,
+            "-image", bif_file,
+            "-arch", "zynq",
+            "-w", "-o", boot_bin,
+        ], timeout=60)
+        print(f"BOOT.BIN generated: {boot_bin}")

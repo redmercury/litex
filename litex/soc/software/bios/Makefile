@@ -22,6 +22,18 @@ OBJECTS = boot-helper.o	\
 	  main.o            \
 	  crt0.o
 
+# Zynq7000 FSBL mode: when ps7_init.c is present (copied from Vivado
+# output by generate_fsbl_boot_image), use crt0_fsbl.S and link in the
+# real ps7_init.  Otherwise use the empty crt0.S + weak stub (legacy
+# mode where an external FSBL initialises the PS).
+ifeq ($(CPU), zynq7000)
+OBJECTS += ps7_stub.o
+ifneq ($(wildcard $(CURDIR)/ps7_init.c),)
+OBJECTS := $(subst crt0.o,crt0_fsbl.o,$(OBJECTS))
+OBJECTS += ps7_init.o
+endif
+endif
+
 ifneq "$(or $(BIOS_CONSOLE_NO_AUTOCOMPLETE),$(BIOS_CONSOLE_LITE))" ""
 CFLAGS += -DBIOS_CONSOLE_NO_AUTOCOMPLETE
 else
